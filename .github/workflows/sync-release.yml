@@ -33,7 +33,8 @@ jobs:
       - name: Checkout automation branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # Do not download the 300MB+ upstream history during every 10-minute check.
+          fetch-depth: 1
 
       - name: Fetch upstream, synchronize, and decide whether to build
         id: check
