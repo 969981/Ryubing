@@ -1,0 +1,231 @@
+name: Sync Ryubing and Release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ryubing-sync-and-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check Forgejo and mirror upstream master
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      tag: ${{ steps.check.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      source: ${{ steps.check.outputs.source }}
+    steps:
+      - name: Checkout automation branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream, synchronize, and decide whether to build
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          official="https://git.ryujinx.app/projects/Ryubing.git"
+          fallback="https://git.aocro.com/mirrors/Ryubing.git"
+          source=""
+          sha=""
+
+          # Forgejo is authoritative. Fallback is a read-only, potentially delayed mirror.
+          for candidate in "$official" "$fallback"; do
+            echo "Checking $candidate"
+            if lines=$(timeout 90 git ls-remote --exit-code "$candidate" refs/heads/master 2>/dev/null); then
+              candidate_sha=$(printf '%s\n' "$lines" | awk 'NR == 1 {print $1}')
+              if [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                source="$candidate"
+                sha="$candidate_sha"
+                break
+              fi
+            fi
+            echo "::warning::Unable to read master from $candidate"
+          done
+
+          if [[ -z "$sha" ]]; then
+            echo "::error::Neither official Forgejo nor the fallback mirror is reachable."
+            exit 1
+          fi
+
+          existing=$(git ls-remote origin refs/heads/upstream-master | awk 'NR == 1 {print $1}')
+          if [[ "$existing" != "$sha" ]]; then
+            echo "Source moved: ${existing:-<new branch>} -> $sha"
+            git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --no-tags "$source" refs/heads/master
+            fetched=$(git rev-parse FETCH_HEAD)
+            if [[ "$fetched" != "$sha" ]]; then
+              echo "::error::Upstream changed during fetch; retry on the next run."
+              exit 1
+            fi
+
+            # Only the dedicated source mirror may be updated; main remains untouched.
+            git push "--force-with-lease=refs/heads/upstream-master:$existing" origin "$sha:refs/heads/upstream-master"
+          else
+            echo "Already synchronized at $sha"
+          fi
+
+          short_sha=$(printf '%s' "$sha" | cut -c 1-12)
+          tag="snapshot-$short_sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping builds."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release for $sha yet; build and publish."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  desktop:
+    name: Build ${{ matrix.rid }}
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, linux-x64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-master
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: NuGet cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ matrix.rid }}-${{ hashFiles('**/global.json', '**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ matrix.rid }}-
+      - name: Configure and publish
+        shell: bash
+        env:
+          RID: ${{ matrix.rid }}
+          SHORT_SHA: ${{ needs.sync.outputs.short_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          version="1.0.0-snapshot.$RUN_NUMBER"
+          sed -i "s|%%RYUJINX_BUILD_VERSION%%|$version|g; s|%%RYUJINX_BUILD_GIT_HASH%%|$SHORT_SHA|g; s|%%RYUJINX_TARGET_RELEASE_CHANNEL_NAME%%|canary|g; s|%%RYUJINX_CONFIG_FILE_NAME%%|Config.json|g" src/Ryujinx.Common/ReleaseInformation.cs
+          dotnet publish src/Ryujinx -c Release -r "$RID" --self-contained true -o publish -p:Version="$version" -p:SourceRevisionId="$SHORT_SHA" -p:ExtraDefineConstants=DISABLE_UPDATER
+
+      - name: Package portable build
+        shell: bash
+        env:
+          RID: ${{ matrix.rid }}
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "$RID" == win-* ]]; then
+            (cd publish && zip -qry "../dist/Ryubing-$TAG-$RID.zip" .)
+          else
+            chmod +x publish/Ryujinx publish/Ryujinx.sh
+            tar -czf "dist/Ryubing-$TAG-$RID.tar.gz" -C publish .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ryubing-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: Build macOS universal app
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-master
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Install GNU readlink for upstream macOS packaging script
+        shell: bash
+        run: |
+          brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: Build and package universal app using upstream script
+        shell: bash
+        env:
+          SHORT_SHA: ${{ needs.sync.outputs.short_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          version="1.0.0-snapshot.$RUN_NUMBER"
+          sed -i '' -e "s|%%RYUJINX_BUILD_VERSION%%|$version|g" -e "s|%%RYUJINX_BUILD_GIT_HASH%%|$SHORT_SHA|g" -e "s|%%RYUJINX_TARGET_RELEASE_CHANNEL_NAME%%|canary|g" -e "s|%%RYUJINX_CONFIG_FILE_NAME%%|Config.json|g" src/Ryujinx.Common/ReleaseInformation.cs
+          export EXTRA_ARGS="-p:ExtraDefineConstants=DISABLE_UPDATER"
+          bash distribution/macos/create_macos_build_ava.sh . publish_tmp publish distribution/macos/entitlements.xml "$version" "$SHORT_SHA" Release 0
+          mkdir -p dist
+          file=$(find publish -maxdepth 1 -name '*.app.tar.gz' -print -quit)
+          test -n "$file"
+          cp "$file" "dist/Ryubing-$TAG-macos-universal.app.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ryubing-macos-universal
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, desktop, macos]
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ryubing-*
+          path: dist
+          merge-multiple: true
+      - name: Verify packages and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          SOURCE: ${{ needs.sync.outputs.source }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          test -f "dist/Ryubing-$TAG-win-x64.zip"
+          test -f "dist/Ryubing-$TAG-linux-x64.tar.gz"
+          test -f "dist/Ryubing-$TAG-macos-universal.app.tar.gz"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, no duplicate created."
+            exit 0
+          fi
+          printf 'Unofficial Ryubing snapshot from upstream commit `%s`.\n\nSource: %s\n\nWindows x64, Linux x64 and macOS universal are included. These are automated builds, not official Ryubing releases.\n' "$SHA" "$SOURCE" > release-notes.md
+          gh release create "$TAG" dist/* --target "$SHA" --title "Ryubing $TAG" --prerelease --notes-file release-notes.md
