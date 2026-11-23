@@ -29,11 +29,23 @@ namespace Ryujinx.Ava.Systems
                         caller: caller)
                 );
 
+            HttpStatusCode? statusCode = null;
+            
             try
             {
-                return await _updateClient.QueryLatestAsync(ReleaseInformation.IsCanaryBuild
+                Return<VersionResponse> response = await _updateClient.QueryLatestAsync(ReleaseInformation.IsCanaryBuild
                     ? ReleaseChannel.Canary
                     : ReleaseChannel.Stable);
+
+                if (response.IsSuccess)
+                {
+                    return response;
+                }
+
+                if (response.IsOf(out GenericError<HttpStatusCode> error))
+                {
+                    statusCode = error.Value;
+                }
             }
             catch (HttpRequestException hre)
                 when (hre.HttpRequestError is HttpRequestError.ConnectionError)
@@ -48,16 +60,27 @@ namespace Ryujinx.Ava.Systems
                     new MessageError("DNS resolution error occurred. Is your internet down?"));
             }
             catch (HttpRequestException hre)
-                when (hre.StatusCode is HttpStatusCode.BadGateway)
             {
-                return Return<VersionResponse>.Failure(
-                    new MessageError("Could not connect to the update server, but it appears like you have internet. It seems like the update server is offline, try again later."));
+                statusCode = hre.StatusCode;
             }
-            catch (HttpRequestException hre)
-                when (hre.StatusCode is HttpStatusCode.TooManyRequests)
+
+            switch (statusCode)
             {
-                return Return<VersionResponse>.Failure(
-                    new MessageError("The update server is rate limited, try again later."));
+                case HttpStatusCode.BadGateway:
+                    return Return<VersionResponse>.Failure(
+                        new MessageError("Could not connect to the update server, but it appears like you have internet. It seems like the update server is offline, try again later."));
+                case HttpStatusCode.TooManyRequests:
+                    return Return<VersionResponse>.Failure(
+                        new MessageError("The update server is rate limited, try again later."));
+                case HttpStatusCode.ServiceUnavailable:
+                    return Return<VersionResponse>.Failure(
+                        new MessageError("The update server is rate limited, try again later."));
+                case HttpStatusCode.NotFound:
+                    return Return<VersionResponse>.Failure(
+                        new MessageError("The update server is not available at the moment."));
+                default:
+                    return Return<VersionResponse>.Failure(
+                        new MessageError("An unknown error occurred."));
             }
         }
 
