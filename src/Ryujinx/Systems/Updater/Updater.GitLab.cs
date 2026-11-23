@@ -53,6 +53,12 @@ namespace Ryujinx.Ava.Systems
                 return Return<VersionResponse>.Failure(
                     new MessageError("Could not connect to the update server, but it appears like you have internet. It seems like the update server is offline, try again later."));
             }
+            catch (HttpRequestException hre)
+                when (hre.StatusCode is HttpStatusCode.TooManyRequests)
+            {
+                return Return<VersionResponse>.Failure(
+                    new MessageError("The update server is rate limited, try again later."));
+            }
         }
 
         public static async Task<Optional<(Version Current, Version Incoming)>> CheckVersionAsync(bool showVersionUpToDate = false)
